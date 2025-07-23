@@ -1,0 +1,33 @@
+# Example ALSA configuration to reduce underruns
+# Copy this to ~/.asoundrc to use it
+
+# Define a PCM device with larger buffer
+pcm.sbitx {
+    type plug
+    slave {
+        pcm "hw:0,0"
+        # Increase period size and buffer size
+        period_size 2048
+        buffer_size 8192
+        # Set format
+        format S32_LE
+        rate 96000
+        channels 2
+    }
+}
+
+# Alternative using dmix for better buffering
+pcm.sbitx_dmix {
+    type dmix
+    ipc_key 1234
+    slave {
+        pcm "hw:0,0"
+        period_size 2048
+        buffer_size 8192
+        rate 96000
+        format S32_LE
+        channels 2
+    }
+}
+
+# To use these, change the device in sbitx from "plughw:0,0" to "sbitx" or "sbitx_dmix"

@@ -5,6 +5,8 @@
 #include <fftw3.h>
 #include <sys/time.h>
 #include <time.h>
+#include <unistd.h>
+#include <string.h>
 #include "sound.h"
 #include "wiringPi.h"
 #include "sdr.h"
@@ -144,8 +146,8 @@ void sound_mixer(char *card_name, char *element, int make_on)
 }
 
 int rate = 96000; /* Sample rate */
-static snd_pcm_uframes_t buff_size = 8192; /* Periodsize (bytes) */ 
-static int n_periods_per_buffer = 2;       /* Number of periods */
+static snd_pcm_uframes_t buff_size = 8192; /* Base buffer size (not used directly) */ 
+static int n_periods_per_buffer = 4;       /* Number of periods */
 //static int n_periods_per_buffer = 1024;       /* Number of periods */
 
 static snd_pcm_t *pcm_play_handle=0;   	//handle for the pcm device
@@ -200,7 +202,7 @@ int sound_start_play(char *device){
 #if DEBUG > 0	
 	printf ("opening audio playback stream to %s\n", device); 
 #endif
-	int e = snd_pcm_open(&pcm_play_handle, device, play_stream, 0);  // was SND_PCM_NONBLOCK
+	int e = snd_pcm_open(&pcm_play_handle, device, play_stream, SND_PCM_NONBLOCK);
 	
 	if (e < 0) {
 		fprintf(stderr, "Error opening PCM playback device %s: %s\n", device, snd_strerror(e));
@@ -265,24 +267,27 @@ int sound_start_play(char *device){
 	}
 */
 
-	// the buffer size is each periodsize x n_periods
-	//	snd_pcm_uframes_t  n_frames= (buff_size  * n_periods_per_buffer)/8;
-	snd_pcm_uframes_t  n_frames= (buff_size  * n_periods_per_buffer)/8*4;		// A Larger buffer - N3SB Hack
+	// Set period and buffer sizes for lower latency with stability
+	// Target: ~2048 frames per period, 4 periods = 8192 frame buffer
+	// At 96kHz, this gives ~85ms total latency
+	snd_pcm_uframes_t period_size = 2048;
+	snd_pcm_uframes_t buffer_size = period_size * n_periods_per_buffer;
+	
 #if DEBUG > 0	
-	printf("trying for buffer size of %ld\n", n_frames);
+	printf("Requesting period_size=%ld, buffer_size=%ld\n", period_size, buffer_size);
 #endif
-/*
-// This function call and the previous have been replaced by the snd_pcm_hw_params_set_period_size_near() function call - N3SB December 2023
-	e = snd_pcm_hw_params_set_buffer_size_near(pcm_play_handle, hwparams, &n_frames);
+
+	// Set the period size
+	e = snd_pcm_hw_params_set_period_size_near(pcm_play_handle, hwparams, &period_size, 0);
 	if (e < 0) {
-		    fprintf(stderr, "*Error setting playback buffersize.\n");
+		    fprintf(stderr, "*Error setting playback period size.\n");
 		    return(-1);
 	}
-*/
-	// This function call replaces the two function calls above - N3SB December 2023
-	e = snd_pcm_hw_params_set_period_size_near(pcm_play_handle, hwparams, &n_frames, 0);
+	
+	// Set the buffer size
+	e = snd_pcm_hw_params_set_buffer_size_near(pcm_play_handle, hwparams, &buffer_size);
 	if (e < 0) {
-		    fprintf(stderr, "*Error setting playback buffersize.\n");
+		    fprintf(stderr, "*Error setting playback buffer size.\n");
 		    return(-1);
 	}
 
@@ -290,6 +295,17 @@ int sound_start_play(char *device){
 		fprintf(stderr, "*Error setting playback HW params.\n");
 		return(-1);
 	}
+	
+	// Get and report actual buffer parameters
+	snd_pcm_uframes_t actual_buffer_size;
+	snd_pcm_uframes_t actual_period_size;
+	snd_pcm_hw_params_get_buffer_size(hwparams, &actual_buffer_size);
+	snd_pcm_hw_params_get_period_size(hwparams, &actual_period_size, 0);
+	
+	// Calculate latency in milliseconds
+	double latency_ms = (double)actual_buffer_size / (double)rate * 1000.0;
+	printf("Audio playback configured: buffer=%lu frames, period=%lu frames, latency=%.1f ms\n", 
+	       actual_buffer_size, actual_period_size, latency_ms);
 
 	// get the current swparams
     e = snd_pcm_sw_params_current(pcm_play_handle, swparams);
@@ -297,9 +313,22 @@ int sound_start_play(char *device){
         printf("Unable to determine current swparams for playback: %s\n", snd_strerror(e));
 	}
 
-    e = snd_pcm_sw_params_set_start_threshold(pcm_play_handle, swparams, (8192) );
+    // Set start threshold to 1 to start immediately when data is available
+    e = snd_pcm_sw_params_set_start_threshold(pcm_play_handle, swparams, 1);
     if (e < 0) {
         printf("Unable to set start threshold mode for playback: %s\n", snd_strerror(e));
+    }
+    
+    // Set avail_min to period size for wakeup
+    e = snd_pcm_sw_params_set_avail_min(pcm_play_handle, swparams, buff_size/8);
+    if (e < 0) {
+        printf("Unable to set avail min for playback: %s\n", snd_strerror(e));
+    }
+    
+    // Apply software parameters
+    e = snd_pcm_sw_params(pcm_play_handle, swparams);
+    if (e < 0) {
+        printf("Unable to set sw params for playback: %s\n", snd_strerror(e));
     }
 
 
@@ -496,11 +525,21 @@ int sound_start_capture(char *device){
 		    return(-1);
 	}
 */
-	snd_pcm_uframes_t  n_frames= (buff_size  * n_periods_per_buffer)/ 8;
-	// This function call replaces the two function calls above - N3SB December 2023
-	e = snd_pcm_hw_params_set_period_size_near(pcm_capture_handle, hwparams, &n_frames, 0);
+	// Match capture buffer to playback for consistency
+	snd_pcm_uframes_t period_size = 2048;
+	snd_pcm_uframes_t buffer_size = period_size * n_periods_per_buffer;
+	
+	// Set period size
+	e = snd_pcm_hw_params_set_period_size_near(pcm_capture_handle, hwparams, &period_size, 0);
 	if (e < 0) {
-		    fprintf(stderr, "*Error setting PCM Capture buffersize.\n");
+		    fprintf(stderr, "*Error setting PCM Capture period size.\n");
+		    return(-1);
+	}
+	
+	// Set buffer size
+	e = snd_pcm_hw_params_set_buffer_size_near(pcm_capture_handle, hwparams, &buffer_size);
+	if (e < 0) {
+		    fprintf(stderr, "*Error setting PCM Capture buffer size.\n");
 		    return(-1);
 	}
 
@@ -689,17 +728,20 @@ int sound_loop(){
   snd_pcm_prepare(pcm_play_handle);
   snd_pcm_prepare(loopback_play_handle);
 
-/*  
-  pcmreturn = snd_pcm_writei(pcm_play_handle, data_out, frames*2);		// Get a head start on filling the queue
+  // Pre-fill the playback buffer with silence to prevent initial underruns
+  memset(data_out, 0, buff_size * 2);  // Clear buffer with silence
+  
+  // Fill multiple periods worth of silence
+  int periods_to_fill = n_periods_per_buffer - 1;  // Leave one period for headroom
+  for (int i = 0; i < periods_to_fill; i++) {
+    pcmreturn = snd_pcm_writei(pcm_play_handle, data_out, frames);
+    if (pcmreturn < 0) {
+      snd_pcm_recover(pcm_play_handle, pcmreturn, 0);
+    }
+  }
 #if DEBUG > 0  
-  printf("Pre-filling play and loopback queues\n");
-  printf("Playback buffer filled with %d samples\n",pcmreturn);
+  printf("Pre-filled playback buffer to prevent initial underruns\n");
 #endif
-  pcmreturn = snd_pcm_writei(loopback_play_handle, data_out, frames);		// Get a head start on filling the queue
-#if DEBUG > 0
-  printf("Loopback buffer filled with %d samples\n",pcmreturn);  
-#endif
-*/
 	//Note: the virtual cable samples queue should be flushed at the start of tx
  	//qloop.stall = 1;
  	
@@ -730,6 +772,11 @@ int sound_loop(){
 
 		while ((pcmreturn = snd_pcm_readi(pcm_capture_handle, data_in, frames)) < 0)
 		{
+			if (pcmreturn == -EAGAIN) {
+				// Not enough data available, wait a bit
+				usleep(1000);
+				continue;
+			}
 			result = snd_pcm_prepare(pcm_capture_handle);
 #if DEBUG > 0
 			printf("**** PCM Capture Error: %s  count = %d\n",snd_strerror(pcmreturn), pcm_capture_error++);
@@ -754,24 +801,27 @@ int sound_loop(){
 			// if don't we have enough to last two iterations loop back...
 			if (q_length(&qloop) < pcmreturn)
 			{
-#if DEBUG > -1
-				puts(" skipping\n");
-#endif
-				continue;
+				// Fill with silence instead of skipping
+				for (i = 0; i < ret_card; i++) {
+					input_i[i] = 0;
+					input_q[i] = 0;
+				}
 			}
-	
-			//copy 1024 samples from the queue.
-			i = 0;
-			j = 0;
-
-			for (int samples  = 0; samples < 1024; samples++)
+			else
 			{
-				int32_t s = q_read(&qloop);
-				input_i[j] = input_q[j] = s;
-				j++; 
+				//copy 1024 samples from the queue.
+				i = 0;
+				j = 0;
+
+				for (int samples  = 0; samples < 1024; samples++)
+				{
+					int32_t s = q_read(&qloop);
+					input_i[j] = input_q[j] = s;
+					j++; 
+				}
+				//fwrite(input_q, 1024, 4, pf);
+				played_samples += 1024;
 			}
-			//fwrite(input_q, 1024, 4, pf);
-			played_samples += 1024;
 		}  // end for use_virtual_cable test
 		else 
 		{
@@ -829,10 +879,21 @@ int sound_loop(){
 			if (pcmreturn == -EPIPE)
 			{
 #if DEBUG > 0
-				printf("Samples Read: %d, Samples Written: %d, delta: %d, available %d\n", samples_read, samples_written, samples_read - samples_written, pcm_write_avail);
-				printf("Available write buffer: %d\n", pcm_write_avail);
+				printf("ALSA underrun occurred - recovering\n");
+				printf("Samples Read: %d, Samples Written: %d, delta: %d\n", samples_read, samples_written, samples_read - samples_written);
 #endif
 				snd_pcm_recover(pcm_play_handle, pcmreturn, 0);
+				// After recovery, prepare the stream again
+				snd_pcm_prepare(pcm_play_handle);
+			}
+			else if (pcmreturn == -ESTRPIPE)
+			{
+				// Stream is suspended, wait until it's resumed
+				while ((pcmreturn = snd_pcm_resume(pcm_play_handle)) == -EAGAIN)
+					sleep(1);
+				if (pcmreturn < 0) {
+					pcmreturn = snd_pcm_prepare(pcm_play_handle);
+				}
 			}
 
 			
@@ -1015,8 +1076,8 @@ void *sound_thread_function(void *ptr){
 	char *device = (char *)ptr;
 	struct sched_param sch;
 
-	//switch to maximum priority
-	sch.sched_priority = sched_get_priority_max(SCHED_FIFO);
+	//switch to high priority but not maximum to avoid priority inversions
+	sch.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;
 	pthread_setschedparam(sound_thread, SCHED_FIFO, &sch);
 
 // Open the PCM Capture Device
@@ -1069,8 +1130,8 @@ void *sound_thread_function(void *ptr){
 void *loopback_thread_function(void *ptr){
 	struct sched_param sch;
 
-	//switch to maximum priority
-	sch.sched_priority = sched_get_priority_max(SCHED_FIFO);
+	//switch to high priority but not maximum to avoid priority inversions
+	sch.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;
 	pthread_setschedparam(loopback_thread, SCHED_FIFO, &sch);
 //	printf("loopback thread is %x\n", loopback_thread);
 //  printf("opening loopback on plughw:1,0 sound card\n");	

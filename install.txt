@@ -156,3 +156,31 @@ this doesnt work with touch as it needs double click
 fro Accessories->File Manager,
 from edit menu go to preferences and in the general tab turn on 
 open files wiht single click
+
+
+Enable NTP to keep time/date up to date:
+
+  1. Stop and disable ntp if installed
+
+  sudo systemctl stop ntp
+  sudo systemctl disable ntp
+
+  2. Enable systemd-timesyncd
+
+  sudo systemctl enable systemd-timesyncd
+  sudo systemctl start systemd-timesyncd
+
+  3. Check time sync status
+
+  timedatectl status
+
+  4. Monitor time synchronization
+
+  timedatectl timesync-status
+
+  For zbitx
+
+  Looking at your error message "Unable to talk to NTP daemon. Is it running?", zbitx expects the traditional ntpd daemon.
+   So use the first method (install ntp) rather than systemd-timesyncd.
+
+  After installing and starting ntp, zbitx should no longer show that error message.
